@@ -427,6 +427,7 @@ class OmniRouter(nn.Module):
         Returns:
             routing_weights (torch.Tensor): routing weights of shape (batch_size, seq_len, top_k)
             selected_experts (torch.Tensor): indices of selected experts of shape (batch_size, seq_len, top_k)
+            router_logits (torch.Tensor): raw logits of shape (batch_size, seq_len, num_experts)
         """
 
         router_logits = self.router(x)  # (batch_size, seq_len, num_experts)
@@ -434,15 +435,17 @@ class OmniRouter(nn.Module):
         # Add noise during training for load balancing
         if self.training and self.router_noise > 0:
             noise = torch.randn_like(router_logits) * self.router_noise
-            router_logits = router_logits + noise
+            router_logits_with_noise = router_logits + noise
+        else:
+            router_logits_with_noise = router_logits
         
         # Get top-k experts
-        routing_weights, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
+        routing_weights, selected_experts = torch.topk(router_logits_with_noise, self.top_k, dim=-1)
         
         # Apply softmax to get normalized weights
         routing_weights = F.softmax(routing_weights, dim=-1)
         
-        return routing_weights, selected_experts
+        return routing_weights, selected_experts, router_logits
 
 class ConformerMoEFeedForward(nn.Module):
     """
@@ -522,7 +525,13 @@ class ConformerMoEFeedForward(nn.Module):
         batch_size, seq_len, d_model = x.shape
         
         # Get routing decisions - top k experts 
-        routing_weights, selected_experts = self.router(x)  # (B, T, top_k), (B, T, top_k)
+        routing_weights, selected_experts, router_logits = self.router(x)  # (B, T, top_k), (B, T, top_k), (B, T, num_experts)
+        
+        # Store for load balance loss computation
+        if self.training:
+            self._last_router_logits = router_logits.detach()
+            self._last_routing_weights = routing_weights.detach()
+            self._last_selected_experts = selected_experts.detach()
         
         # Flatten for easier processing
         x_flat = x.view(-1, d_model)  # (B*T, d_model)
@@ -592,6 +601,44 @@ class ConformerMoEFeedForward(nn.Module):
                 if self.use_bias:
                     nn.init.uniform_(expert[0].bias, -ffn1_max, ffn1_max)
                     nn.init.uniform_(expert[3].bias, -ffn2_max, ffn2_max)
+    
+    def get_load_balance_loss(self):
+        """
+        Compute load balancing auxiliary loss as in Switch Transformer.
+        
+        Formula: L = num_experts * Σ(f_i * P_i)
+        where:
+            f_i = fraction of tokens routed to expert i (after top-k selection)
+            P_i = mean routing probability for expert i (before top-k selection)
+        
+        This encourages the router to distribute load evenly across experts.
+        
+        Returns:
+            torch.Tensor: scalar load balance loss
+        """
+        if not self.training or not hasattr(self, '_last_router_logits'):
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        
+        router_logits = self._last_router_logits  # (B, T, num_experts)
+        selected_experts = self._last_selected_experts  # (B, T, top_k)
+        
+        batch_size, seq_len, _ = router_logits.shape
+        num_tokens = batch_size * seq_len
+        
+        # Compute P_i: mean routing probability per expert (across all tokens)
+        router_probs = F.softmax(router_logits, dim=-1)  # (B, T, num_experts)
+        P_i = router_probs.mean(dim=[0, 1])  # (num_experts,) - average probability
+        
+        # Compute f_i: fraction of tokens actually routed to each expert
+        # Create one-hot encoding of selected experts
+        expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts)  # (B, T, top_k, num_experts)
+        expert_mask = expert_mask.sum(dim=2).float()  # (B, T, num_experts)
+        f_i = expert_mask.sum(dim=[0, 1]) / (num_tokens * self.top_k)  # (num_experts,)
+        
+        # Switch Transformer load balance loss: N * Σ(f_i * P_i)
+        load_balance_loss = self.num_experts * torch.sum(f_i * P_i)
+        
+        return load_balance_loss
 
 
 class ConformerMoELayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
@@ -798,3 +845,23 @@ class ConformerMoELayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixi
             return x
         else:
             return x, cache_last_channel, cache_last_time
+    
+    def get_load_balance_loss(self):
+        """
+        Collect load balance loss from both MoE feed-forward modules.
+        
+        Returns:
+            torch.Tensor: weighted load balance loss from both FFN modules
+        """
+        loss = 0.0
+        
+        # Get loss from first feed-forward module
+        if hasattr(self.feed_forward1, 'get_load_balance_loss'):
+            loss += self.feed_forward1.get_load_balance_loss()
+        
+        # Get loss from second feed-forward module
+        if hasattr(self.feed_forward2, 'get_load_balance_loss'):
+            loss += self.feed_forward2.get_load_balance_loss()
+        
+        # Apply layer-specific weight
+        return loss * self.load_balance_loss_weight
