@@ -137,7 +137,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
         # Convert to Hydra 1.0 compatible DictConfig
         cfg = model_utils.convert_model_config_to_dict_config(cfg)
-        cfg = model_utils.maybe_update_config_version(cfg)
+        cfg = model_utils.maybe_update_config_version(cfg, make_copy=False)
         _config_check(cfg)
 
         self.prompt_format = cfg.prompt_format
@@ -253,7 +253,10 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         # Setup encoder adapters (from ASRAdapterModelMixin)
         self.setup_adapters()
 
-        timestamps_asr_model = self.__restore_timestamps_asr_model()
+        if self.cfg.get("restore_timestamps_model", True):
+            timestamps_asr_model = self.__restore_timestamps_asr_model()
+        else:
+            timestamps_asr_model = None
         # Using object.__setattr__ to bypass PyTorch's module registration
         object.__setattr__(self, 'timestamps_asr_model', timestamps_asr_model)
 
@@ -543,7 +546,11 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                     timestamps = 'no'
                 else:
                     timestamps = str(timestamps)
-                    assert timestamps in ('yes', 'no', 'timestamp', 'notimestamp', '1', '0')
+                    if timestamps not in ('yes', 'no', 'timestamp', 'notimestamp', '1', '0'):
+                        raise ValueError(
+                            f"Unsupported timestamps value '{timestamps}'. "
+                            f"Must be one of: 'yes', 'no', 'timestamp', 'notimestamp', '1', '0'."
+                        )
                 prompt['timestamp'] = timestamps
             else:
                 prompt['timestamp'] = 'no'
@@ -570,12 +577,33 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
         if trcfg.enable_chunking:
             # Check if only one audio is provided with string
-            is_one_audio = isinstance(audio, str) and not (audio.endswith("json") or audio.endswith("jsonl"))
-            # Check if it is provided as a list of strings
-            is_one_audio = is_one_audio or (isinstance(audio, list) and len(audio) == 1)
+            is_manifest = isinstance(audio, str) and audio.endswith(("json", "jsonl"))
+            if is_manifest:
+                try:
+                    with open(audio, "r", encoding="utf-8") as manifest_f:
+                        non_empty = 0
+                        for line in manifest_f:
+                            if line.strip():
+                                non_empty += 1
+                                if non_empty > 1:
+                                    break
+                        is_one_audio = non_empty == 1
+                except OSError as e:
+                    logging.warning(f"Failed to inspect manifest '{audio}' for chunking: {e}")
+                    is_one_audio = False
+            else:
+                is_one_audio = isinstance(audio, str) or (isinstance(audio, list) and len(audio) == 1)
             # Check if chunking will be enabled
             trcfg.enable_chunking = (is_one_audio or trcfg.batch_size == 1) and self.timestamps_asr_model is not None
-            if not trcfg.enable_chunking:
+
+            if trcfg.enable_chunking:
+                if self.decoding.cfg.get('return_xattn_scores', False):
+                    logging.warning(
+                        "When chunking is enabled, cross-attention scores will not be returned even though "
+                        "`return_xattn_scores` is set to True. If you want to return the cross-attention scores "
+                        "set `enable_chunking` to False in the MultiTaskTranscriptionConfig in override_config."
+                    )
+            else:
                 logging.warning("Chunking is disabled. Please pass a single audio file or set batch_size to 1")
 
         results = super().transcribe(audio=audio, override_config=trcfg)
@@ -587,10 +615,11 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
 
-        assert config.get("use_lhotse", False), (
-            "Multi-task model only supports dataloading with Lhotse. "
-            "Please set config.{train,validation,test}_ds.use_lhotse=True"
-        )
+        if not config.get("use_lhotse", False):
+            raise ValueError(
+                "Multi-task model only supports dataloading with Lhotse. "
+                "Please set config.{train,validation,test}_ds.use_lhotse=True"
+            )
         global_rank = config.get("global_rank", self.global_rank)
         world_size = config.get("world_size", self.world_size)
         enable_chunking = config.get("enable_chunking", False)
@@ -720,7 +749,10 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 of shape (B, D, T).
             processed_signal_length: Vector of length B, that contains the individual lengths of the
                 processed audio sequences.
-            # TODO: Add support for `transcript` and `transcript_length` in the docstring
+            transcript: Tensor that represents a batch of target transcriptions,
+                of shape [B, T]. Used as decoder input during teacher-forced training.
+            transcript_length: Vector of length B, that contains the individual lengths of the
+                target transcription sequences.
 
         Returns:
             A tuple of 3 elements -
@@ -1048,10 +1080,21 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
         del enc_states, enc_mask, decoder_input_ids
 
+        # Determine the cut id to inject into hypotheses for chunking
+        if trcfg.enable_chunking or trcfg.timestamps:
+            if isinstance(batch, PromptedAudioToTextMiniBatch):
+                cut_id = batch.cuts[0].id
+                audio = batch.audio
+                audio_lens = batch.audio_lens
+            else:  # TensorDataset / external DataLoader tuple type batch
+                cut_id = 'audio_0'
+                audio = batch[0]
+                audio_lens = batch[1]
+
         if trcfg.timestamps and self.timestamps_asr_model is not None:
             hypotheses = get_forced_aligned_timestamps_with_external_model(
-                audio=[audio.squeeze()[:audio_len] for audio, audio_len in zip(batch.audio, batch.audio_lens)],
-                batch_size=len(batch.audio),
+                audio=[audio.squeeze()[:audio_len] for audio, audio_len in zip(audio, audio_lens)],
+                batch_size=len(audio),
                 external_ctc_model=self.timestamps_asr_model,
                 main_model_predictions=hypotheses,
                 timestamp_type='char' if merge_to_be_done else ['word', 'segment'],
@@ -1073,11 +1116,12 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 decoding=self.decoding,
             )
             # Inject the id of the cut to hypothese to later be used for separate batches
-            setattr(merged_hypotheses, 'id', batch.cuts[0].id.rsplit('-', 1)[0])
+            setattr(merged_hypotheses, 'id', cut_id)
             return [merged_hypotheses]
 
-        if trcfg.enable_chunking and len(hypotheses) == 1:
-            setattr(hypotheses[0], 'id', batch.cuts[0].id)
+        if trcfg.enable_chunking:
+            for hyp in hypotheses:
+                setattr(hyp, 'id', cut_id)
         return hypotheses
 
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
@@ -1298,18 +1342,34 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         The config and weights are expected to be in the main .nemo file and be named `timestamps_asr_model_config.yaml` and `timestamps_asr_model_weights.ckpt` respectively.
         """
         app_state = AppState()
+        nemo_file_folder = app_state.nemo_file_folder  # Already-extracted temp directory
         model_restore_path = app_state.model_restore_path
 
         if not model_restore_path:
             return None
 
         save_restore_connector = SaveRestoreConnector()
+        save_restore_connector.model_config_yaml = os.path.join(nemo_file_folder, "timestamps_asr_model_config.yaml")
+        save_restore_connector.model_weights_ckpt = os.path.join(nemo_file_folder, "timestamps_asr_model_weights.ckpt")
 
-        filter_fn = lambda name: "timestamps_asr_model" in name
-        members = save_restore_connector._filtered_tar_info(model_restore_path, filter_fn=filter_fn)
+        # Check if the model_restore_path is already an extracted directory (which happens during restore_from)
+        # If so, use it directly to avoid double extraction
+        if app_state.nemo_file_folder and os.path.isdir(app_state.nemo_file_folder):
+            # Verify that the timestamp model components exist in the extracted folder
+            config_exists = os.path.exists(save_restore_connector.model_config_yaml)
+            weights_exists = os.path.exists(save_restore_connector.model_weights_ckpt)
 
-        if not members:
-            return None
+            if not (config_exists and weights_exists):
+                return None
+
+            save_restore_connector.model_extracted_dir = app_state.nemo_file_folder
+
+        else:
+            filter_fn = lambda name: "timestamps_asr_model" in name
+            members = save_restore_connector._filtered_tar_info(model_restore_path, filter_fn=filter_fn)
+
+            if not members:
+                return None
 
         try:
             save_restore_connector.model_config_yaml = "timestamps_asr_model_config.yaml"
@@ -1318,6 +1378,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 model_restore_path, save_restore_connector=save_restore_connector
             )
             external_timestamps_model.eval()
+
         except Exception as e:
             raise RuntimeError(
                 f"Error restoring external timestamps ASR model with timestamps_asr_model_config.yaml and timestamps_asr_model_weights.ckpt: {e}"
@@ -1356,21 +1417,21 @@ def parse_multitask_prompt(prompt: dict | None) -> list[dict]:
     #     ],
     # )
     if 'turns' in prompt:
-        assert (
+        if not (
             len(prompt) == 1
             and isinstance(prompt["turns"], list)
             and all(isinstance(t, dict) and "role" in t and "slots" in t for t in prompt["turns"])
-        ), (
-            f"When providing a multi-turn prompt through 'turns', no other keys are allowed "
-            f"and the value under prompt['turns'] must be a list of dicts with roles and slot values "
-            f"(we received {prompt=})"
-        )
+        ):
+            raise ValueError(
+                f"When providing a multi-turn prompt through 'turns', no other keys are allowed "
+                f"and the value under prompt['turns'] must be a list of dicts with roles and slot values "
+                f"(we received {prompt=})"
+            )
         return prompt["turns"]
 
     values_are_dicts = any(isinstance(v, dict) for k, v in prompt.items() if k != "slots")
-    assert not values_are_dicts, (
-        f"We don't support dict values for prompt keys other than 'slots'. " f"We received {prompt=}"
-    )
+    if values_are_dicts:
+        raise ValueError(f"We don't support dict values for prompt keys other than 'slots'. " f"We received {prompt=}")
 
     # Case 2.
     # Single-turn prompting format with explicitly provided role and slot names and values.
@@ -1382,10 +1443,11 @@ def parse_multitask_prompt(prompt: dict | None) -> list[dict]:
     #     slots=dict(source_lang='en', target_lang='de', task='asr', pnc=True, context='translate this text'),
     # )
     if "role" in prompt and "slots" in prompt:
-        assert isinstance(prompt["slots"], dict), (
-            f"When providing a single-turn prompt through 'role', 'slots' must also be provided "
-            f"(we received {prompt=})."
-        )
+        if not isinstance(prompt["slots"], dict):
+            raise ValueError(
+                f"When providing a single-turn prompt through 'role', 'slots' must also be provided "
+                f"as a dict (we received {prompt=})."
+            )
         return [prompt]
 
     # Case 3.
