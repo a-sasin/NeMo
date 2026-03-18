@@ -39,7 +39,7 @@ from torch import nn
 from nemo.collections.asr.models.configs import CacheAwareStreamingConfig
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
-from nemo.collections.asr.parts.submodules.conformer_modules import ConformerMoELayer
+from nemo.collections.asr.parts.submodules.conformer_modules import ConformerMoELayer, OmniRouter
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     LocalAttRelPositionalEncoding,
     MultiHeadAttention,
@@ -233,6 +233,7 @@ class ConformerMoEEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixi
         top_k=2,
         router_noise=0.01,
         load_balance_loss_weight=0.01,
+        use_shared_router: bool = False,
         # Standard Conformer parameters
         causal_downsampling=False,
         subsampling='striding',
@@ -276,6 +277,7 @@ class ConformerMoEEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixi
         self.top_k = top_k
         self.router_noise = router_noise
         self.load_balance_loss_weight = load_balance_loss_weight
+        self.use_shared_router = use_shared_router
         
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
@@ -395,7 +397,20 @@ class ConformerMoEEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixi
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
-        # Create MoE Conformer layers
+        # Optional global shared router: one OmniRouter reused across all MoE layers.
+        # If disabled, each layer creates its own local router.
+        if self.use_shared_router:
+            self.global_router = OmniRouter(
+                d_model=d_model,
+                num_experts=num_experts,
+                top_k=top_k,
+                use_bias=False,
+                router_noise=router_noise,
+            )
+        else:
+            self.global_router = None
+
+        # Create MoE Conformer layers – all share the same global router
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             layer = ConformerMoELayer(
@@ -422,6 +437,8 @@ class ConformerMoEEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixi
                 top_k=top_k,
                 router_noise=router_noise,
                 load_balance_loss_weight=load_balance_loss_weight,
+                shared_router=self.global_router,
+                use_shared_router=self.use_shared_router,
             )
             self.layers.append(layer)
 
@@ -444,10 +461,12 @@ class ConformerMoEEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixi
         
         # will be set in self.forward() if defined in AccessMixin config
         self.interctc_capture_at_layers = None
+
+        router_mode = "global shared router" if self.use_shared_router else f"{n_layers} local routers"
         
         logging.info(
             f"Created ConformerMoEEncoder with {n_layers} layers, "
-            f"{num_experts} experts per layer, top-{top_k} routing"
+            f"{num_experts} experts per layer, top-{top_k} routing [{router_mode}]"
         )
 
     def forward_for_export(
@@ -1007,6 +1026,7 @@ class ConformerMoEConfig:
     top_k: int = 2
     router_noise: float = 0.01
     load_balance_loss_weight: float = 0.01
+    use_shared_router: bool = False
     
     # Standard Conformer parameters
     ff_expansion_factor: int = 4
@@ -1014,5 +1034,3 @@ class ConformerMoEConfig:
     conv_kernel_size: int = 31
     dropout: float = 0.1
     dropout_att: float = 0.0
-    
-    # Can add more parameters as needed

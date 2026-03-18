@@ -572,6 +572,15 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
 
         # Add auxiliary losses, if registered
         loss_value = self.add_auxiliary_losses(loss_value)
+        
+        # Add MoE load balancing loss if using MoE encoder
+        if hasattr(self.encoder, 'get_load_balance_loss'):
+            lb_loss = self.encoder.get_load_balance_loss()
+            if lb_loss.item() > 0:
+                loss_value = loss_value + lb_loss
+                if (batch_nb + 1) % log_every_n_steps == 0:
+                    self.log('train_load_balance_loss', lb_loss, prog_bar=False, logger=True)
+        
         # only computing WER when requested in the logs (same as done for final-layer WER below)
         loss_value, tensorboard_logs = self.add_interctc_losses(
             loss_value, transcript, transcript_len, compute_wer=((batch_nb + 1) % log_every_n_steps == 0)
@@ -636,7 +645,19 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
         loss_value = self.loss(
             log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
         )
-        loss_value, metrics = self.add_interctc_losses(
+        
+        # Add MoE load balancing loss if using MoE encoder
+        if hasattr(self.encoder, 'get_load_balance_loss'):
+            lb_loss = self.encoder.get_load_balance_loss()
+            if lb_loss.item() > 0:
+                loss_value = loss_value + lb_loss
+                metrics = {'val_load_balance_loss': lb_loss}
+            else:
+                metrics = {}
+        else:
+            metrics = {}
+        
+        loss_value, interctc_metrics = self.add_interctc_losses(
             loss_value,
             transcript,
             transcript_len,
@@ -644,6 +665,7 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
             log_wer_num_denom=True,
             log_prefix="val_",
         )
+        metrics.update(interctc_metrics)
 
         self.wer.update(
             predictions=log_probs,

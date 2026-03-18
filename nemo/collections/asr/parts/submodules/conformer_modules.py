@@ -13,6 +13,8 @@
 # limitations under the License.
 #
 
+from typing import Optional
+
 import torch
 from torch import nn as nn
 from torch.nn import LayerNorm
@@ -30,7 +32,7 @@ from nemo.collections.common.parts.utils import activation_registry
 from nemo.core.classes.mixins import AccessMixin
 import torch.nn.functional as F
 
-__all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer', 'ConformerMoEFeedForward', 'ConformerMoELayer']
+__all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer', 'ConformerMoEFeedForward', 'ConformerMoELayer', 'OmniRouter']
 
 
 class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
@@ -419,10 +421,12 @@ class OmniRouter(nn.Module):
         # Router is a simple linear layer that outputs logits for each expert
         self.router = nn.Linear(d_model, num_experts, bias=use_bias)
         
-    def forward(self, x):
+    def forward(self, x, pad_mask=None):
         """
         Args:
             x (torch.Tensor): input tensor of shape (batch_size, seq_len, d_model)
+            pad_mask (torch.Tensor, optional): bool tensor of shape (batch_size, seq_len)
+                where True denotes padded frames.
         
         Returns:
             routing_weights (torch.Tensor): routing weights of shape (batch_size, seq_len, top_k)
@@ -445,7 +449,9 @@ class OmniRouter(nn.Module):
         # Apply softmax to get normalized weights
         routing_weights = F.softmax(routing_weights, dim=-1)
         
-        return routing_weights, selected_experts, router_logits
+        # Return the logits that were actually used for routing (with noise during training)
+        # This ensures load balance loss computes P_i from the same distribution used for selection
+        return routing_weights, selected_experts, router_logits_with_noise
 
 class ConformerMoEFeedForward(nn.Module):
     """
@@ -471,7 +477,9 @@ class ConformerMoEFeedForward(nn.Module):
         dropout=0.1, 
         activation=Swish(), 
         use_bias=True,
-        router_noise=0.1
+        router_noise=0.1,
+        router: Optional['OmniRouter'] = None,
+        use_shared_router: bool = False,
     ):
         super(ConformerMoEFeedForward, self).__init__()
         self.d_model = d_model
@@ -480,9 +488,20 @@ class ConformerMoEFeedForward(nn.Module):
         self.top_k = top_k
         self.use_bias = use_bias
         self.dropout_rate = dropout
-        
-        # Omni Router
-        self.router = OmniRouter(d_model, num_experts, top_k, use_bias=False, router_noise=router_noise)
+        self.use_shared_router = use_shared_router
+
+        # Router selection policy:
+        # - use_shared_router=True: consume the externally provided shared router.
+        # - use_shared_router=False: ignore any external router and create a layer-local router.
+        #
+        # Shared router is stored via object.__setattr__ to avoid duplicate nn.Module
+        # registration under each layer (the encoder owns registration and optimizer/state_dict).
+        if self.use_shared_router:
+            if router is None:
+                raise ValueError("use_shared_router=True but no shared router was provided.")
+            object.__setattr__(self, 'router', router)
+        else:
+            self.router = OmniRouter(d_model, num_experts, top_k, use_bias=False, router_noise=router_noise)
         
         # Create expert weights as stacked tensors for grouped matmul
         # Shape: (num_experts, d_ff, d_model) for w1 and (num_experts, d_model, d_ff) for w2
@@ -499,6 +518,9 @@ class ConformerMoEFeedForward(nn.Module):
         self.activation = activation
         self.dropout = nn.Dropout(p=dropout)
         
+        # Flag to enable routing data capture during inference (for visualization)
+        self.capture_routing_data = False
+        
         # Initialize weights
         self._reset_parameters()
         
@@ -514,10 +536,12 @@ class ConformerMoEFeedForward(nn.Module):
                 nn.init.uniform_(self.b1, -ffn1_max, ffn1_max)
                 nn.init.uniform_(self.b2, -ffn2_max, ffn2_max)
     
-    def forward(self, x):
+    def forward(self, x, pad_mask=None):
         """
         Args:
             x (torch.Tensor): input tensor of shape (batch_size, seq_len, d_model)
+            pad_mask (torch.Tensor, optional): bool tensor of shape (batch_size, seq_len)
+                where True denotes padded frames.
         
         Returns:
             output (torch.Tensor): output tensor of shape (batch_size, seq_len, d_model)
@@ -525,68 +549,83 @@ class ConformerMoEFeedForward(nn.Module):
         batch_size, seq_len, d_model = x.shape
         
         # Get routing decisions - top k experts 
-        routing_weights, selected_experts, router_logits = self.router(x)  # (B, T, top_k), (B, T, top_k), (B, T, num_experts)
+        routing_weights, selected_experts, router_logits = self.router(
+            x, pad_mask=pad_mask
+        )  # (B, T, top_k), (B, T, top_k), (B, T, num_experts)
         
-        # Store for load balance loss computation
-        if self.training:
-            self._last_router_logits = router_logits.detach()
+        # Store for load balance loss computation (training) or visualization (inference)
+        if self.training or self.capture_routing_data:
+            # Keep gradient path for auxiliary load-balancing loss during training.
+            # Detaching here prevents the router from receiving useful gradients.
+            self._last_router_logits = router_logits
             self._last_routing_weights = routing_weights.detach()
             self._last_selected_experts = selected_experts.detach()
+            self._last_pad_mask = pad_mask.detach() if pad_mask is not None else None
         
-        # Flatten for easier processing
-        x_flat = x.view(-1, d_model)  # (B*T, d_model)
-        routing_weights_flat = routing_weights.view(-1, self.top_k)  # (B*T, top_k)
-        selected_experts_flat = selected_experts.view(-1, self.top_k)  # (B*T, top_k)
-        
-        # Initialize output
-        output_flat = torch.zeros_like(x_flat)  # (B*T, d_model)
-        
-        # CRITICAL: process ALL experts for ALL top_k positions to keep GPU stacks in sync
-        # Even if an expert gets 0 tokens, it still does the computation (just on empty tensors) - fix for deadlocks :)
+        # Flatten tokens for dispatch
+        num_tokens = batch_size * seq_len
+        x_flat = x.view(num_tokens, d_model)                               # (B*T, d_model)
+        routing_weights_flat = routing_weights.view(num_tokens, self.top_k)   # (B*T, top_k)
+        selected_experts_flat = selected_experts.view(num_tokens, self.top_k)  # (B*T, top_k)
+        if pad_mask is not None:
+            valid_mask_flat = (~pad_mask).view(num_tokens).to(x_flat.dtype)
+        else:
+            valid_mask_flat = x_flat.new_ones(num_tokens)
+
+        # Accumulate expert contributions into output_flat.
+        # Starting from zeros (no grad), each `output_flat + full_out * weights_k`
+        # builds up a grad_fn chain that connects the output to BOTH:
+        #
+        #   (a) expert weights (w1, w2) via non-inplace .index_add()
+        #       .index_add() returns a NEW tensor with grad_fn=IndexAddBackward so that
+        #       gradients flow:  loss → full_out → expert_out → matmul → w1, w2
+        #       (contrast with zeros[idx]=src or index_add_() on a leaf tensor, which
+        #        silently severs the grad path because the leaf's requires_grad=False)
+        #
+        #   (b) routing weights (router) via  full_out * weights_k
+        #       weights_k = routing_weights_flat[:, k] carries a grad_fn from softmax(topk)
+        #       so loss → weighted → weights_k → softmax → router logits → W_router
+        #
+        # CRITICAL: ALL (k, expert_idx) iterations MUST execute on EVERY GPU regardless
+        # of whether any tokens were assigned to that expert.  This keeps the DDP/NCCL
+        # all-reduce stacks in sync and prevents distributed deadlocks.
+        output_flat = x_flat.new_zeros(num_tokens, d_model)
+
         for k in range(self.top_k):
-            expert_ids = selected_experts_flat[:, k]  # (B*T,)
-            weights = routing_weights_flat[:, k]  # (B*T,)
-            
-            # Process each expert - THIS LOOP MUST EXECUTE FOR ALL EXPERTS ON ALL GPUs
+            # Exclude padded frames from routing contributions
+            weights_k     = routing_weights_flat[:, k] * valid_mask_flat
+            expert_ids_k  = selected_experts_flat[:, k]     # (B*T,)  int indices, no grad
 
             for expert_idx in range(self.num_experts):
 
-                # Find tokens assigned to this expert
-                token_mask = (expert_ids == expert_idx)
-                token_indices = torch.nonzero(token_mask, as_tuple=True)[0]
-                
-                # torch.matmul handles empty tensors (returns empty tensor)
-            
-                # Gather tokens for this expert (may be empty tensor with shape [0, d_model])
-                expert_input = x_flat[token_indices]  # (num_tokens, d_model) - can be (0, d_model)
-                expert_weights = weights[token_indices]  # (num_tokens,) - can be (0,)
-                
-                # First linear layer - grouped matmul
-                hidden = torch.matmul(expert_input, self.w1[expert_idx].t())  # (num_tokens, d_ff)
+                token_indices = (expert_ids_k == expert_idx).nonzero(as_tuple=True)[0]
+
+                # Sparse expert FFN — torch.matmul handles shape-(0, d) tensors fine
+                expert_input = x_flat[token_indices]                             # (n, d_model)
+                hidden = torch.matmul(expert_input, self.w1[expert_idx].t())    # (n, d_ff)
                 if self.use_bias:
                     hidden = hidden + self.b1[expert_idx]
-                
-                # Activation
                 hidden = self.activation(hidden)
-                
-                # Dropout
                 hidden = self.dropout(hidden)
-                
-                # Second linear layer - grouped matmul
-                expert_output = torch.matmul(hidden, self.w2[expert_idx].t())  # (num_tokens, d_model)
+                expert_out = torch.matmul(hidden, self.w2[expert_idx].t())      # (n, d_model)
                 if self.use_bias:
-                    expert_output = expert_output + self.b2[expert_idx]
-                
-                # Scatter results back (no-op if token_indices is empty)
-                if token_indices.numel() > 0:
-                    # Weight the expert output
-                    weighted_output = expert_output * expert_weights.unsqueeze(-1)
-                    # Add to output at the appropriate indices
-                    output_flat.index_add_(0, token_indices, weighted_output)
-        
-        # Reshape back
+                    expert_out = expert_out + self.b2[expert_idx]
+
+                # Non-inplace index_add: returns a NEW tensor with grad_fn=IndexAddBackward.
+                # grad_expert_out[i] = grad_full_out[token_indices[i]]  (a simple gather)
+                # This is the fix: expert weights now receive gradients from the task loss.
+                full_out = x_flat.new_zeros(num_tokens, d_model).index_add(
+                    0, token_indices, expert_out
+                )                                                                # (B*T, d_model)
+
+                # Scale by routing weight and accumulate — grad flows to both
+                # full_out (→ w1, w2) and weights_k (→ router)
+                output_flat = output_flat + full_out * weights_k.unsqueeze(-1)
+
         output = output_flat.view(batch_size, seq_len, d_model)
-        
+        if pad_mask is not None:
+            output = output.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+
         return output
     
     def reset_parameters_ff(self):
@@ -595,12 +634,11 @@ class ConformerMoEFeedForward(nn.Module):
         ffn2_max = self.d_ff**-0.5
         
         with torch.no_grad():
-            for expert in self.experts:
-                nn.init.uniform_(expert[0].weight, -ffn1_max, ffn1_max)  # linear1
-                nn.init.uniform_(expert[3].weight, -ffn2_max, ffn2_max)  # linear2
-                if self.use_bias:
-                    nn.init.uniform_(expert[0].bias, -ffn1_max, ffn1_max)
-                    nn.init.uniform_(expert[3].bias, -ffn2_max, ffn2_max)
+            nn.init.uniform_(self.w1, -ffn1_max, ffn1_max)
+            nn.init.uniform_(self.w2, -ffn2_max, ffn2_max)
+            if self.use_bias:
+                nn.init.uniform_(self.b1, -ffn1_max, ffn1_max)
+                nn.init.uniform_(self.b2, -ffn2_max, ffn2_max)
     
     def get_load_balance_loss(self):
         """
@@ -623,17 +661,23 @@ class ConformerMoEFeedForward(nn.Module):
         selected_experts = self._last_selected_experts  # (B, T, top_k)
         
         batch_size, seq_len, _ = router_logits.shape
-        num_tokens = batch_size * seq_len
+        if hasattr(self, '_last_pad_mask') and self._last_pad_mask is not None:
+            valid_mask = (~self._last_pad_mask).to(router_logits.dtype)  # (B, T)
+        else:
+            valid_mask = torch.ones(batch_size, seq_len, device=router_logits.device, dtype=router_logits.dtype)
+
+        num_valid_tokens = valid_mask.sum().clamp_min(1.0)
         
         # Compute P_i: mean routing probability per expert (across all tokens)
         router_probs = F.softmax(router_logits, dim=-1)  # (B, T, num_experts)
-        P_i = router_probs.mean(dim=[0, 1])  # (num_experts,) - average probability
+        P_i = (router_probs * valid_mask.unsqueeze(-1)).sum(dim=[0, 1]) / num_valid_tokens  # (num_experts,)
         
         # Compute f_i: fraction of tokens actually routed to each expert
         # Create one-hot encoding of selected experts
         expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts)  # (B, T, top_k, num_experts)
         expert_mask = expert_mask.sum(dim=2).float()  # (B, T, num_experts)
-        f_i = expert_mask.sum(dim=[0, 1]) / (num_tokens * self.top_k)  # (num_experts,)
+        expert_mask = expert_mask * valid_mask.unsqueeze(-1)
+        f_i = expert_mask.sum(dim=[0, 1]) / (num_valid_tokens * self.top_k)  # (num_experts,)
         
         # Switch Transformer load balance loss: N * Σ(f_i * P_i)
         load_balance_loss = self.num_experts * torch.sum(f_i * P_i)
@@ -643,10 +687,11 @@ class ConformerMoEFeedForward(nn.Module):
 
 class ConformerMoELayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
     """
-    A Conformer encoder layer with Mixture of Experts feed-forward modules.
-    
-    This is similar to ConformerLayer but replaces the two feed-forward modules 
-    with MoE feed-forward modules.
+    A Conformer encoder layer with a single Mixture of Experts feed-forward module.
+
+    The block order is: Self-Attention → Convolution → MoE Feed-Forward → Output.
+    Unlike the standard ConformerLayer (which has two half-scaled FF modules sandwiching
+    attention and convolution), this layer uses one MoE FF module placed after convolution.
     """
     
     def __init__(
@@ -674,6 +719,8 @@ class ConformerMoELayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixi
         top_k=2,
         router_noise=0.1,
         load_balance_loss_weight=0.0,
+        shared_router: Optional['OmniRouter'] = None,
+        use_shared_router: bool = False,
     ):
         super(ConformerMoELayer, self).__init__()
         
@@ -684,20 +731,9 @@ class ConformerMoELayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixi
         self.self_attention_model = self_attention_model
         self.n_heads = n_heads
         self.fc_factor = 0.5
-        
-        # first feed forward module (MoE)
-        self.norm_feed_forward1 = LayerNorm(d_model)
-        self.feed_forward1 = ConformerMoEFeedForward(
-            d_model=d_model, 
-            d_ff=d_ff, 
-            num_experts=num_experts,
-            top_k=top_k,
-            dropout=dropout, 
-            use_bias=use_bias,
-            router_noise=router_noise
-        )
+        self.use_shared_router = use_shared_router
 
-        # store load balance loss weight 
+        # store load balance loss weight
         self.load_balance_loss_weight = load_balance_loss_weight
         
         # convolution module
@@ -756,16 +792,18 @@ class ConformerMoELayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixi
                 f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos']"
             )
         
-        # second feed forward module (MoE)
-        self.norm_feed_forward2 = LayerNorm(d_model)
-        self.feed_forward2 = ConformerMoEFeedForward(
+        # feed forward module (MoE)
+        self.norm_feed_forward = LayerNorm(d_model)
+        self.feed_forward = ConformerMoEFeedForward(
             d_model=d_model, 
             d_ff=d_ff, 
             num_experts=num_experts,
             top_k=top_k,
             dropout=dropout, 
             use_bias=use_bias,
-            router_noise=router_noise
+            router_noise=router_noise,
+            router=shared_router,
+            use_shared_router=use_shared_router,
         )
         
         self.dropout = nn.Dropout(dropout)
@@ -786,10 +824,6 @@ class ConformerMoELayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixi
             cache_last_time (torch.tensor) : next cache for convolutional layers (B, d_model, T_cache)
         """
         residual = x
-        x = self.norm_feed_forward1(x)
-        x = self.feed_forward1(x)
-        residual = residual + self.dropout(x) * self.fc_factor
-        
         x = self.norm_self_att(residual)
         if self.self_attention_model == 'rel_pos':
             x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
@@ -822,8 +856,8 @@ class ConformerMoELayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixi
             (x, cache_last_time) = x
         residual = residual + self.dropout(x)
         
-        x = self.norm_feed_forward2(residual)
-        x = self.feed_forward2(x)
+        x = self.norm_feed_forward(residual)
+        x = self.feed_forward(x, pad_mask=pad_mask)
         residual = residual + self.dropout(x) * self.fc_factor
         
         x = self.norm_out(residual)
@@ -855,13 +889,9 @@ class ConformerMoELayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixi
         """
         loss = 0.0
         
-        # Get loss from first feed-forward module
-        if hasattr(self.feed_forward1, 'get_load_balance_loss'):
-            loss += self.feed_forward1.get_load_balance_loss()
-        
-        # Get loss from second feed-forward module
-        if hasattr(self.feed_forward2, 'get_load_balance_loss'):
-            loss += self.feed_forward2.get_load_balance_loss()
+        # Get loss from the MoE feed-forward module
+        if hasattr(self.feed_forward, 'get_load_balance_loss'):
+            loss += self.feed_forward.get_load_balance_loss()
         
         # Apply layer-specific weight
         return loss * self.load_balance_loss_weight
