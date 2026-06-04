@@ -39,12 +39,18 @@ class EvaluationConfig:
         asr_model_name: ASR model for transcription (e.g., "nvidia/parakeet-tdt-1.1b").
         language: Language code for transcription (e.g., "en").
         with_utmosv2: Whether to compute UTMOSv2 (Mean Opinion Score) metrics.
+        with_fcd: Whether to compute Frechet Codec Distance metric.
+        codec_model_path: Path to the audio codec model. If None, will skip computing Frechet Codec Distance metric.
+        device: Device to use for running models used during evaluation.
     """
 
     sv_model: str = "titanet"
     asr_model_name: str = "nvidia/parakeet-tdt-1.1b"
     language: str = "en"
     with_utmosv2: bool = True
+    with_fcd: bool = True
+    codec_model_path: str = None
+    device: str = "cuda"
 
 
 def evaluate_generated_audio_dir(
@@ -59,6 +65,7 @@ def evaluate_generated_audio_dir(
     - ASR-based metrics: Character Error Rate (CER), Word Error Rate (WER)
     - Speaker similarity: Cosine similarity using speaker embeddings
     - Audio quality: UTMOSv2 scores (if enabled)
+    - Freceht Codec Distance (FCD) metric (if enabled)
 
     Args:
         manifest_path: Path to the evaluation manifest (NDJSON format).
@@ -81,6 +88,9 @@ def evaluate_generated_audio_dir(
         sv_model_type=config.sv_model,
         asr_model_name=config.asr_model_name,
         with_utmosv2=config.with_utmosv2,
+        with_fcd=config.with_fcd,
+        codec_model_path=config.codec_model_path,
+        device=config.device,
     )
 
     return avg_metrics, filewise_metrics
@@ -88,19 +98,19 @@ def evaluate_generated_audio_dir(
 
 def compute_mean_with_confidence_interval(
     metrics_list: List[dict],
-    metric_keys: List[str],
     confidence: float = 0.95,
 ) -> Dict[str, str]:
-    """Compute mean and confidence interval for specified metrics.
+    """Compute mean and confidence interval for all metrics present in the dicts.
 
     Args:
         metrics_list: List of metric dictionaries (one per repeat/run).
-        metric_keys: List of metric names to compute statistics for.
         confidence: Confidence level (default: 0.95 for 95% CI).
 
     Returns:
         Dictionary mapping metric names to [mean, CI].
     """
+    metric_keys = list(metrics_list[0].keys())
+
     if len(metrics_list) < 2:
         # Can't compute CI with fewer than 2 samples
         return {key: f"{metrics_list[0].get(key, 0):.4f} (single sample)" for key in metric_keys}
@@ -108,11 +118,6 @@ def compute_mean_with_confidence_interval(
     results = {}
     for key in metric_keys:
         measurements = [m[key] for m in metrics_list if key in m]
-        if not measurements:
-            logging.warning(f"Metric '{key}' not found in any measurements")
-            results[key] = "N/A"
-            continue
-
         mean = np.mean(measurements)
         std_err = stats.sem(measurements)
 
@@ -125,23 +130,4 @@ def compute_mean_with_confidence_interval(
     return results
 
 
-# Define the standard metric keys used in evaluation
-STANDARD_METRIC_KEYS = [
-    'cer_filewise_avg',
-    'wer_filewise_avg',
-    'cer_cumulative',
-    'wer_cumulative',
-    'ssim_pred_gt_avg',
-    'ssim_pred_context_avg',
-    'ssim_gt_context_avg',
-    'ssim_pred_gt_avg_alternate',
-    'ssim_pred_context_avg_alternate',
-    'ssim_gt_context_avg_alternate',
-    'cer_gt_audio_cumulative',
-    'wer_gt_audio_cumulative',
-    'utmosv2_avg',
-    'total_gen_audio_seconds',
-]
-
-# Default metrics to show in violin plots
 DEFAULT_VIOLIN_METRICS = ['cer', 'pred_context_ssim', 'utmosv2']

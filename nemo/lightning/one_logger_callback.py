@@ -18,17 +18,24 @@ OneLogger callback for NeMo training.
 This module provides a callback that integrates OneLogger telemetry with NeMo training.
 """
 import os
+import warnings
 from typing import Any, Dict
 
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
-from nv_one_logger.api.config import OneLoggerConfig
-from nv_one_logger.training_telemetry.api.callbacks import on_app_start
-from nv_one_logger.training_telemetry.api.config import TrainingTelemetryConfig
-from nv_one_logger.training_telemetry.api.training_telemetry_provider import TrainingTelemetryProvider
-from nv_one_logger.training_telemetry.integration.pytorch_lightning import TimeEventCallback as OneLoggerPTLCallback
 
 from nemo.lightning.base_callback import BaseCallback
+
+try:
+    from nv_one_logger.api.config import OneLoggerConfig
+    from nv_one_logger.training_telemetry.api.callbacks import on_app_start
+    from nv_one_logger.training_telemetry.api.config import TrainingTelemetryConfig
+    from nv_one_logger.training_telemetry.api.training_telemetry_provider import TrainingTelemetryProvider
+    from nv_one_logger.training_telemetry.integration.pytorch_lightning import TimeEventCallback as OneLoggerPTLCallback
+    _ONE_LOGGER_AVAILABLE = True
+except ModuleNotFoundError as exc:
+    _ONE_LOGGER_AVAILABLE = False
+    _ONE_LOGGER_IMPORT_ERROR = exc
 
 # Export all symbols for testing and usage
 __all__ = ['OneLoggerNeMoCallback']
@@ -202,48 +209,6 @@ def get_nemo_v1_callback_config(trainer: Any) -> Dict[str, Any]:
     return config
 
 
-def get_nemo_v2_callback_config(
-    trainer: Any,
-    data: Any,
-) -> Dict[str, Any]:
-    """Generate NeMo v2 specific configuration for the OneLogger training callback.
-
-    This function extracts the global batch size and sequence length from the provided NeMo v2 data module,
-    and uses them to construct the configuration dictionary for the OneLogger training callback.
-
-    Args:
-        trainer: PyTorch Lightning trainer instance.
-        data: NeMo v2 data module (required).
-
-    Returns:
-        Dictionary containing the NeMo v2 training callback configuration.
-    """
-    # NeMo v2: Extract batch size and sequence length from data module (most reliable source)
-    global_batch_size = 1  # Default fallback
-    seq_length = 1  # Default fallback
-
-    if data is not None:
-        seq_length = data.seq_length
-        # Prefer explicit global_batch_size if provided by the data module
-        if hasattr(data, 'global_batch_size') and getattr(data, 'global_batch_size') is not None:
-            global_batch_size = int(getattr(data, 'global_batch_size'))
-        else:
-            # Fall back to micro_batch_size multiplied by WORLD_SIZE when global_batch_size is unavailable
-            micro_batch_size = getattr(data, 'micro_batch_size', None)
-            if micro_batch_size is not None:
-                world_size = int(os.environ.get('WORLD_SIZE', 1))
-                global_batch_size = int(micro_batch_size) * world_size
-
-    # Get base configuration with calculated values
-    config = _get_base_callback_config(
-        trainer=trainer,
-        global_batch_size=global_batch_size,
-        seq_length=seq_length,
-    )
-
-    return config
-
-
 def _should_enable_for_current_rank() -> bool:
     """Determine if OneLogger should be enabled for the current rank.
 
@@ -259,44 +224,58 @@ def _should_enable_for_current_rank() -> bool:
     return rank == 0
 
 
-class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
-    """Adapter extending OneLogger's PTL callback with init + config update.
+if _ONE_LOGGER_AVAILABLE:
 
-    __init__ configures the provider from meta info, then calls super().__init__.
-    update_config computes TrainingTelemetryConfig and applies it.
-    """
+    class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
+        """Adapter extending OneLogger's PTL callback with init + config update.
 
-    _instance = None
+        __init__ configures the provider from meta info, then calls super().__init__.
+        update_config computes TrainingTelemetryConfig and applies it.
+        """
 
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        _instance = None
 
-    def __init__(self) -> None:
-        if getattr(self, '_initialized', False):
-            return
-        init_config = get_one_logger_init_config()
-        one_logger_config = OneLoggerConfig(**init_config)
-        TrainingTelemetryProvider.instance().with_base_config(
-            one_logger_config
-        ).with_export_config().configure_provider()
-        # Initialize underlying OneLogger PTL callback
-        super().__init__(TrainingTelemetryProvider.instance(), call_on_app_start=False)
-        # Explicitly signal application start after provider configuration
-        on_app_start()
+        def __new__(cls, *args, **kwargs):
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
 
-    def update_config(self, nemo_version: str, trainer: Trainer, **kwargs) -> None:
-        # Avoid this function being called multiple times
-        if TrainingTelemetryProvider.instance().config.telemetry_config is not None:
-            return
-        if nemo_version == 'v1':
+        def __init__(self) -> None:
+            if getattr(self, '_initialized', False):
+                return
+            init_config = get_one_logger_init_config()
+            one_logger_config = OneLoggerConfig(**init_config)
+            TrainingTelemetryProvider.instance().with_base_config(
+                one_logger_config
+            ).with_export_config().configure_provider()
+            # Initialize underlying OneLogger PTL callback
+            super().__init__(TrainingTelemetryProvider.instance(), call_on_app_start=False)
+            # Explicitly signal application start after provider configuration
+            on_app_start()
+
+        def update_config(self, nemo_version: str, trainer: Trainer, **kwargs) -> None:
+            # Avoid this function being called multiple times
+            if TrainingTelemetryProvider.instance().config.telemetry_config is not None:
+                return
             config = get_nemo_v1_callback_config(trainer=trainer)
-        elif nemo_version == 'v2':
-            # v2 expects data module in kwargs
-            data = kwargs.get('data', None)
-            config = get_nemo_v2_callback_config(trainer=trainer, data=data)
-        else:
-            config = get_nemo_v1_callback_config(trainer=trainer)
-        training_telemetry_config = TrainingTelemetryConfig(**config)
-        TrainingTelemetryProvider.instance().set_training_telemetry_config(training_telemetry_config)
+            training_telemetry_config = TrainingTelemetryConfig(**config)
+            TrainingTelemetryProvider.instance().set_training_telemetry_config(training_telemetry_config)
+
+else:
+
+    class OneLoggerNeMoCallback(BaseCallback):
+        """No-op OneLogger callback when nv_one_logger is unavailable."""
+
+        _warned = False
+
+        def __init__(self) -> None:
+            if not self.__class__._warned:
+                warnings.warn(
+                    "nv_one_logger is not installed; OneLogger telemetry is disabled. "
+                    "Install nv_one_logger to enable telemetry.",
+                    RuntimeWarning,
+                )
+                self.__class__._warned = True
+
+        def update_config(self, *args, **kwargs) -> None:
+            return None
