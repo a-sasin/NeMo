@@ -181,7 +181,7 @@ class ProfilingBatchGenerator:
 
     def reset(self):
         """Reset the generator to prepare it for a new search."""
-        self._current = self.start_batch_size
+        self._current = max(1, self.start_batch_size)
         self._max_ok = None  # max batch size that works
         self._min_err = None  # min batch size that doesn't work
 
@@ -199,11 +199,16 @@ class ProfilingBatchGenerator:
             self._min_err = min(float("inf") if self._min_err is None else self._min_err, self._current)
             # Training step failed on OOM
             if self._max_ok is None:
+                # If batch size 1 still fails, bucket is infeasible under current settings.
+                if self._current <= 1:
+                    self._max_ok = 0
+                    self._min_err = 1
+                    return True
                 # We haven't found a batch size that works yet, keep going 2x down.
-                self._current = round(self._current / 2)
+                self._current = max(1, round(self._current / 2))
             else:
                 # Try the middle-point between the known extremes.
-                self._current = round((self._max_ok + self._min_err) / 2)
+                self._current = max(1, round((self._max_ok + self._min_err) / 2))
         else:
             # Training step successful.
             # Update the maximum known batch size that works.
@@ -213,7 +218,7 @@ class ProfilingBatchGenerator:
                 self._current *= 2
             else:
                 # Try the middle-point between the known extremes.
-                self._current = round((self._max_ok + self._min_err) / 2)
+                self._current = max(1, round((self._max_ok + self._min_err) / 2))
 
         return False
 
@@ -479,7 +484,8 @@ def oomptimizer(
                     click.secho(f"OOM!", fg="yellow")
                     oom = True
                 except RuntimeError as e:
-                    if "cuFFT error: CUFFT_INTERNAL_ERROR" not in str(e):
+                    msg = str(e).lower()
+                    if not (("out of memory" in msg) or ("cufft" in msg)):
                         raise
                     click.secho(f"OOM!", fg="yellow")
                     oom = True
@@ -495,6 +501,8 @@ def oomptimizer(
                     #       between OOMptimizer and the actual training. During training, there is some
                     #       degree of memory fragmentation and it's better to simulate that in OOMptimizer.
                     # torch.cuda.memory.empty_cache()
+                    if oom:
+                        torch.cuda.empty_cache()
                     torch.cuda.reset_max_memory_allocated()
                 return oom
 
@@ -508,7 +516,7 @@ def oomptimizer(
                 fg="green",
             )
             profile[(bucket, seq_len_in, seq_len_out)] = gen.max_batch_size
-            gen.start_batch_size = gen.max_batch_size * 2
+            gen.start_batch_size = max(1, gen.max_batch_size * 2)
 
     # Reverse the profile to be ascendingly sorted again.
     profile = dict(reversed(list(profile.items())))

@@ -18,17 +18,24 @@ OneLogger callback for NeMo training.
 This module provides a callback that integrates OneLogger telemetry with NeMo training.
 """
 import os
+import warnings
 from typing import Any, Dict
 
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
-from nv_one_logger.api.config import OneLoggerConfig
-from nv_one_logger.training_telemetry.api.callbacks import on_app_start
-from nv_one_logger.training_telemetry.api.config import TrainingTelemetryConfig
-from nv_one_logger.training_telemetry.api.training_telemetry_provider import TrainingTelemetryProvider
-from nv_one_logger.training_telemetry.integration.pytorch_lightning import TimeEventCallback as OneLoggerPTLCallback
 
 from nemo.lightning.base_callback import BaseCallback
+
+try:
+    from nv_one_logger.api.config import OneLoggerConfig
+    from nv_one_logger.training_telemetry.api.callbacks import on_app_start
+    from nv_one_logger.training_telemetry.api.config import TrainingTelemetryConfig
+    from nv_one_logger.training_telemetry.api.training_telemetry_provider import TrainingTelemetryProvider
+    from nv_one_logger.training_telemetry.integration.pytorch_lightning import TimeEventCallback as OneLoggerPTLCallback
+    _ONE_LOGGER_AVAILABLE = True
+except ModuleNotFoundError as exc:
+    _ONE_LOGGER_AVAILABLE = False
+    _ONE_LOGGER_IMPORT_ERROR = exc
 
 # Export all symbols for testing and usage
 __all__ = ['OneLoggerNeMoCallback']
@@ -217,38 +224,58 @@ def _should_enable_for_current_rank() -> bool:
     return rank == 0
 
 
-class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
-    """Adapter extending OneLogger's PTL callback with init + config update.
+if _ONE_LOGGER_AVAILABLE:
 
-    __init__ configures the provider from meta info, then calls super().__init__.
-    update_config computes TrainingTelemetryConfig and applies it.
-    """
+    class OneLoggerNeMoCallback(OneLoggerPTLCallback, BaseCallback):
+        """Adapter extending OneLogger's PTL callback with init + config update.
 
-    _instance = None
+        __init__ configures the provider from meta info, then calls super().__init__.
+        update_config computes TrainingTelemetryConfig and applies it.
+        """
 
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        _instance = None
 
-    def __init__(self) -> None:
-        if getattr(self, '_initialized', False):
-            return
-        init_config = get_one_logger_init_config()
-        one_logger_config = OneLoggerConfig(**init_config)
-        TrainingTelemetryProvider.instance().with_base_config(
-            one_logger_config
-        ).with_export_config().configure_provider()
-        # Initialize underlying OneLogger PTL callback
-        super().__init__(TrainingTelemetryProvider.instance(), call_on_app_start=False)
-        # Explicitly signal application start after provider configuration
-        on_app_start()
+        def __new__(cls, *args, **kwargs):
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
 
-    def update_config(self, nemo_version: str, trainer: Trainer, **kwargs) -> None:
-        # Avoid this function being called multiple times
-        if TrainingTelemetryProvider.instance().config.telemetry_config is not None:
-            return
-        else:
+        def __init__(self) -> None:
+            if getattr(self, '_initialized', False):
+                return
+            init_config = get_one_logger_init_config()
+            one_logger_config = OneLoggerConfig(**init_config)
+            TrainingTelemetryProvider.instance().with_base_config(
+                one_logger_config
+            ).with_export_config().configure_provider()
+            # Initialize underlying OneLogger PTL callback
+            super().__init__(TrainingTelemetryProvider.instance(), call_on_app_start=False)
+            # Explicitly signal application start after provider configuration
+            on_app_start()
+
+        def update_config(self, nemo_version: str, trainer: Trainer, **kwargs) -> None:
+            # Avoid this function being called multiple times
+            if TrainingTelemetryProvider.instance().config.telemetry_config is not None:
+                return
             config = get_nemo_v1_callback_config(trainer=trainer)
-        training_telemetry_config = TrainingTelemetryConfig(**config)
-        TrainingTelemetryProvider.instance().set_training_telemetry_config(training_telemetry_config)
+            training_telemetry_config = TrainingTelemetryConfig(**config)
+            TrainingTelemetryProvider.instance().set_training_telemetry_config(training_telemetry_config)
+
+else:
+
+    class OneLoggerNeMoCallback(BaseCallback):
+        """No-op OneLogger callback when nv_one_logger is unavailable."""
+
+        _warned = False
+
+        def __init__(self) -> None:
+            if not self.__class__._warned:
+                warnings.warn(
+                    "nv_one_logger is not installed; OneLogger telemetry is disabled. "
+                    "Install nv_one_logger to enable telemetry.",
+                    RuntimeWarning,
+                )
+                self.__class__._warned = True
+
+        def update_config(self, *args, **kwargs) -> None:
+            return None

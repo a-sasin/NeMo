@@ -76,11 +76,25 @@ class BoostingTreeModelConfig:
 
     @staticmethod
     def is_empty(cfg: "BoostingTreeModelConfig") -> bool:
+        def _safe_get(obj, key, default=None):
+            if obj is None:
+                return default
+            if isinstance(obj, DictConfig):
+                return OmegaConf.select(obj, key, default=default)
+            return getattr(obj, key, default)
+
+        # Backward compatibility:
+        # Some older .nemo configs may not include `key_phrase_items_list`.
+        model_path = _safe_get(cfg, "model_path")
+        key_phrases_file = _safe_get(cfg, "key_phrases_file")
+        key_phrases_list = _safe_get(cfg, "key_phrases_list")
+        key_phrase_items_list = _safe_get(cfg, "key_phrase_items_list")
+
         return (
-            cfg.model_path is None
-            and cfg.key_phrases_file is None
-            and (not cfg.key_phrases_list)
-            and (not cfg.key_phrase_items_list)
+            model_path is None
+            and key_phrases_file is None
+            and (not key_phrases_list)
+            and (not key_phrase_items_list)
         )
 
 
